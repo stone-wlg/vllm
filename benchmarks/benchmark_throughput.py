@@ -6,9 +6,16 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+import uvloop
+from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
-from tqdm import tqdm
+
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.entrypoints.openai.api_server import (
+    build_async_engine_client_from_engine_args)
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+from vllm.utils import FlexibleArgumentParser, merge_async_iterators
 
 
 def sample_requests(
@@ -29,22 +36,23 @@ def sample_requests(
     dataset = [(data["conversations"][0]["value"],
                 data["conversations"][1]["value"]) for data in dataset]
 
-    # Tokenize the prompts and completions.
-    prompts = [prompt for prompt, _ in dataset]
-    prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
-    completion_token_ids = tokenizer(completions).input_ids
-    tokenized_dataset = []
-    for i in range(len(dataset)):
-        output_len = len(completion_token_ids[i])
-        if fixed_output_len is not None:
-            output_len = fixed_output_len
-        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+    # Shuffle the dataset.
+    random.shuffle(dataset)
 
-    # Filter out too long sequences.
+    # Filter out sequences that are too long or too short
     filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests:
+            break
+
+        # Tokenize the prompts and completions.
+        prompt = dataset[i][0]
+        prompt_token_ids = tokenizer(prompt).input_ids
+        completion = dataset[i][1]
+        completion_token_ids = tokenizer(completion).input_ids
         prompt_len = len(prompt_token_ids)
+        output_len = len(completion_token_ids
+                         ) if fixed_output_len is None else fixed_output_len
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
@@ -53,9 +61,7 @@ def sample_requests(
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
 
-    # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
-    return sampled_requests
+    return filtered_dataset
 
 
 def run_vllm(
@@ -72,47 +78,151 @@ def run_vllm(
     max_model_len: Optional[int],
     enforce_eager: bool,
     kv_cache_dtype: str,
+    quantization_param_path: Optional[str],
     device: str,
     enable_prefix_caching: bool,
+    enable_chunked_prefill: bool,
+    max_num_batched_tokens: int,
+    distributed_executor_backend: Optional[str],
     gpu_memory_utilization: float = 0.9,
+    num_scheduler_steps: int = 1,
+    use_v2_block_manager: bool = False,
+    download_dir: Optional[str] = None,
+    load_format: str = EngineArgs.load_format,
+    disable_async_output_proc: bool = False,
 ) -> float:
     from vllm import LLM, SamplingParams
-    llm = LLM(model=model,
-              tokenizer=tokenizer,
-              quantization=quantization,
-              tensor_parallel_size=tensor_parallel_size,
-              seed=seed,
-              trust_remote_code=trust_remote_code,
-              dtype=dtype,
-              max_model_len=max_model_len,
-              gpu_memory_utilization=gpu_memory_utilization,
-              enforce_eager=enforce_eager,
-              kv_cache_dtype=kv_cache_dtype,
-              device=device,
-              enable_prefix_caching=enable_prefix_caching)
+    llm = LLM(
+        model=model,
+        tokenizer=tokenizer,
+        quantization=quantization,
+        tensor_parallel_size=tensor_parallel_size,
+        seed=seed,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization_param_path=quantization_param_path,
+        device=device,
+        enable_prefix_caching=enable_prefix_caching,
+        download_dir=download_dir,
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_batched_tokens=max_num_batched_tokens,
+        distributed_executor_backend=distributed_executor_backend,
+        load_format=load_format,
+        num_scheduler_steps=num_scheduler_steps,
+        use_v2_block_manager=use_v2_block_manager,
+        disable_async_output_proc=disable_async_output_proc,
+    )
 
     # Add the requests to the engine.
+    prompts: List[str] = []
+    sampling_params: List[SamplingParams] = []
     for prompt, _, output_len in requests:
-        sampling_params = SamplingParams(
-            n=n,
-            temperature=0.0 if use_beam_search else 1.0,
-            top_p=1.0,
-            use_beam_search=use_beam_search,
-            ignore_eos=True,
-            max_tokens=output_len,
-        )
-        # FIXME(woosuk): Do not use internal method.
-        llm._add_request(
-            prompt=prompt,
-            prompt_token_ids=None,
-            sampling_params=sampling_params,
-        )
+        prompts.append(prompt)
+        sampling_params.append(
+            SamplingParams(
+                n=n,
+                temperature=0.0 if use_beam_search else 1.0,
+                top_p=1.0,
+                use_beam_search=use_beam_search,
+                ignore_eos=True,
+                max_tokens=output_len,
+            ))
 
     start = time.perf_counter()
-    # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
+    llm.generate(prompts, sampling_params, use_tqdm=True)
     end = time.perf_counter()
     return end - start
+
+
+async def run_vllm_async(
+    requests: List[Tuple[str, int, int]],
+    model: str,
+    tokenizer: str,
+    quantization: Optional[str],
+    tensor_parallel_size: int,
+    seed: int,
+    n: int,
+    use_beam_search: bool,
+    trust_remote_code: bool,
+    dtype: str,
+    max_model_len: Optional[int],
+    enforce_eager: bool,
+    kv_cache_dtype: str,
+    quantization_param_path: Optional[str],
+    device: str,
+    enable_prefix_caching: bool,
+    enable_chunked_prefill: bool,
+    max_num_batched_tokens: int,
+    distributed_executor_backend: Optional[str],
+    gpu_memory_utilization: float = 0.9,
+    num_scheduler_steps: int = 1,
+    use_v2_block_manager: bool = False,
+    download_dir: Optional[str] = None,
+    load_format: str = EngineArgs.load_format,
+    disable_async_output_proc: bool = False,
+    disable_frontend_multiprocessing: bool = False,
+) -> float:
+    from vllm import SamplingParams
+    engine_args = AsyncEngineArgs(
+        model=model,
+        tokenizer=tokenizer,
+        quantization=quantization,
+        tensor_parallel_size=tensor_parallel_size,
+        seed=seed,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization_param_path=quantization_param_path,
+        device=device,
+        enable_prefix_caching=enable_prefix_caching,
+        download_dir=download_dir,
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_batched_tokens=max_num_batched_tokens,
+        distributed_executor_backend=distributed_executor_backend,
+        load_format=load_format,
+        num_scheduler_steps=num_scheduler_steps,
+        use_v2_block_manager=use_v2_block_manager,
+        disable_async_output_proc=disable_async_output_proc,
+        worker_use_ray=False,
+        engine_use_ray=False,
+        disable_log_requests=True,
+    )
+
+    async with build_async_engine_client_from_engine_args(
+            engine_args, disable_frontend_multiprocessing) as llm:
+
+        # Add the requests to the engine.
+        prompts: List[str] = []
+        sampling_params: List[SamplingParams] = []
+        for prompt, _, output_len in requests:
+            prompts.append(prompt)
+            sampling_params.append(
+                SamplingParams(
+                    n=n,
+                    temperature=0.0 if use_beam_search else 1.0,
+                    top_p=1.0,
+                    use_beam_search=use_beam_search,
+                    ignore_eos=True,
+                    max_tokens=output_len,
+                ))
+
+        generators = []
+        start = time.perf_counter()
+        for i, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
+            generator = llm.generate(prompt, sp, request_id=f"test{i}")
+            generators.append(generator)
+        all_gens = merge_async_iterators(*generators)
+        async for i, res in all_gens:
+            pass
+        end = time.perf_counter()
+        return end - start
 
 
 def run_hf(
@@ -181,13 +291,15 @@ def run_mii(
     tensor_parallel_size: int,
     output_len: int,
 ) -> float:
-    from mii import pipeline
-    llm = pipeline(model, tensor_parallel=tensor_parallel_size)
+    from mii import client, serve
+    llm = serve(model, tensor_parallel=tensor_parallel_size)
     prompts = [prompt for prompt, _, _ in requests]
 
     start = time.perf_counter()
-    llm(prompts, max_new_tokens=output_len)
+    llm.generate(prompts, max_new_tokens=output_len)
     end = time.perf_counter()
+    client = client(model)
+    client.terminate_server()
     return end - start
 
 
@@ -208,12 +320,24 @@ def main(args: argparse.Namespace):
                                    args.output_len)
 
     if args.backend == "vllm":
-        elapsed_time = run_vllm(
+        run_args = [
             requests, args.model, args.tokenizer, args.quantization,
             args.tensor_parallel_size, args.seed, args.n, args.use_beam_search,
             args.trust_remote_code, args.dtype, args.max_model_len,
-            args.enforce_eager, args.kv_cache_dtype, args.device,
-            args.enable_prefix_caching, args.gpu_memory_utilization)
+            args.enforce_eager, args.kv_cache_dtype,
+            args.quantization_param_path, args.device,
+            args.enable_prefix_caching, args.enable_chunked_prefill,
+            args.max_num_batched_tokens, args.distributed_executor_backend,
+            args.gpu_memory_utilization, args.num_scheduler_steps,
+            args.use_v2_block_manager, args.download_dir, args.load_format,
+            args.disable_async_output_proc
+        ]
+
+        if args.async_engine:
+            run_args.append(args.disable_frontend_multiprocessing)
+            elapsed_time = uvloop.run(run_vllm_async(*run_args))
+        else:
+            elapsed_time = run_vllm(*run_args)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -229,9 +353,21 @@ def main(args: argparse.Namespace):
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
 
+    # Output JSON results if specified
+    if args.output_json:
+        results = {
+            "elapsed_time": elapsed_time,
+            "num_requests": len(requests),
+            "total_num_tokens": total_num_tokens,
+            "requests_per_second": len(requests) / elapsed_time,
+            "tokens_per_second": total_num_tokens / elapsed_time,
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=4)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark the throughput.")
+    parser = FlexibleArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",
                         type=str,
                         choices=["vllm", "hf", "mii"],
@@ -253,7 +389,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
-                        choices=['awq', 'gptq', 'squeezellm', None],
+                        choices=[*QUANTIZATION_METHODS, None],
                         default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--n",
@@ -298,22 +434,103 @@ if __name__ == "__main__":
                         action="store_true",
                         help="enforce eager execution")
     parser.add_argument(
-        "--kv-cache-dtype",
+        '--kv-cache-dtype',
         type=str,
-        choices=["auto", "fp8_e5m2"],
+        choices=['auto', 'fp8', 'fp8_e5m2', 'fp8_e4m3'],
         default="auto",
-        help=
-        'Data type for kv cache storage. If "auto", will use model data type.')
+        help='Data type for kv cache storage. If "auto", will use model '
+        'data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. '
+        'ROCm (AMD GPU) supports fp8 (=fp8_e4m3)')
+    parser.add_argument(
+        '--quantization-param-path',
+        type=str,
+        default=None,
+        help='Path to the JSON file containing the KV cache scaling factors. '
+        'This should generally be supplied, when KV cache dtype is FP8. '
+        'Otherwise, KV cache scaling factors default to 1.0, which may cause '
+        'accuracy issues. FP8_E5M2 (without scaling) is only supported on '
+        'cuda version greater than 11.8. On ROCm (AMD GPU), FP8_E4M3 is '
+        'instead supported for common inference criteria.')
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        choices=["cuda"],
-        help='device type for vLLM execution, supporting CUDA only currently.')
+        default="auto",
+        choices=["auto", "cuda", "cpu", "openvino", "tpu", "xpu"],
+        help='device type for vLLM execution, supporting CUDA, OpenVINO and '
+        'CPU.')
+    parser.add_argument(
+        "--num-scheduler-steps",
+        type=int,
+        default=1,
+        help="Maximum number of forward steps per scheduler call.")
+    parser.add_argument("--use-v2-block-manager",
+                        action='store_true',
+                        help="Enable block manager v2.")
     parser.add_argument(
         "--enable-prefix-caching",
         action='store_true',
-        help="enable automatic prefix caching for vLLM backend.")
+        help="Enable automatic prefix caching for vLLM backend.")
+    parser.add_argument("--enable-chunked-prefill",
+                        action='store_true',
+                        help="enable chunked prefill for vLLM backend.")
+    parser.add_argument('--max-num-batched-tokens',
+                        type=int,
+                        default=None,
+                        help='maximum number of batched tokens per '
+                        'iteration')
+    parser.add_argument('--download-dir',
+                        type=str,
+                        default=None,
+                        help='directory to download and load the weights, '
+                        'default to the default cache dir of huggingface')
+    parser.add_argument(
+        '--output-json',
+        type=str,
+        default=None,
+        help='Path to save the throughput results in JSON format.')
+    parser.add_argument(
+        '--distributed-executor-backend',
+        choices=['ray', 'mp'],
+        default=None,
+        help='Backend to use for distributed serving. When more than 1 GPU '
+        'is used, will be automatically set to "ray" if installed '
+        'or "mp" (multiprocessing) otherwise.')
+    parser.add_argument(
+        '--load-format',
+        type=str,
+        default=EngineArgs.load_format,
+        choices=[
+            'auto', 'pt', 'safetensors', 'npcache', 'dummy', 'tensorizer',
+            'bitsandbytes'
+        ],
+        help='The format of the model weights to load.\n\n'
+        '* "auto" will try to load the weights in the safetensors format '
+        'and fall back to the pytorch bin format if safetensors format '
+        'is not available.\n'
+        '* "pt" will load the weights in the pytorch bin format.\n'
+        '* "safetensors" will load the weights in the safetensors format.\n'
+        '* "npcache" will load the weights in pytorch format and store '
+        'a numpy cache to speed up the loading.\n'
+        '* "dummy" will initialize the weights with random values, '
+        'which is mainly for profiling.\n'
+        '* "tensorizer" will load the weights using tensorizer from '
+        'CoreWeave. See the Tensorize vLLM Model script in the Examples'
+        'section for more information.\n'
+        '* "bitsandbytes" will load the weights using bitsandbytes '
+        'quantization.\n')
+    parser.add_argument(
+        "--disable-async-output-proc",
+        action='store_true',
+        default=False,
+        help="Disable async output processor for vLLM backend.")
+    parser.add_argument("--async-engine",
+                        action='store_true',
+                        default=False,
+                        help="Use vLLM async engine rather than LLM class.")
+    parser.add_argument("--disable-frontend-multiprocessing",
+                        action='store_true',
+                        default=False,
+                        help="Disable decoupled async engine frontend.")
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

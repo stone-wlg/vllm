@@ -18,10 +18,16 @@ body:
       # For security purposes, please feel free to check the contents of collect_env.py before running it.
       python collect_env.py
       ```
+      It is suggested to download and execute the latest script, as vllm might frequently update the diagnosis information needed for accurately and quickly responding to issues.
     value: |
+      <details>
+      <summary>The output of `python collect_env.py`</summary>
+
       ```text
-      The output of `python collect_env.py`
+      Your output of `python collect_env.py` here
       ```
+      
+      </details>
   validations:
     required: true
 - type: textarea
@@ -57,6 +63,10 @@ body:
       If the code is too long (hopefully, it isn't), feel free to put it in a public gist and link it in the issue: https://gist.github.com.
 
       Please also paste or describe the results you observe instead of the expected results. If you observe an error, please paste the error message including the **full** traceback of the exception. It may be relevant to wrap error messages in ```` ```triple quotes blocks``` ````.
+
+      Please set the environment variable `export VLLM_LOGGING_LEVEL=DEBUG` to turn on more logging to help debugging potential issues.
+
+      If you experienced crashes or hangs, it would be helpful to run vllm with `export VLLM_TRACE_FUNCTION=1` . All the function calls in vllm will be recorded. Inspect these log files, and tell which function crashes or hangs.
     placeholder: |
       A clear and concise description of what the bug is.
 
@@ -79,3 +89,10 @@ body:
       - If the error only appears in vllm, please provide the detailed script of how you run `transformers` and `vllm`, also highlight the difference and what you expect.
 
       Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and asked the chatbot living at the bottom right corner of the [documentation page](https://docs.vllm.ai/en/latest/), which can answer lots of frequently asked questions.
+        required: true

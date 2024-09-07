@@ -1,10 +1,10 @@
-from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional, Set
 
 import torch
 
-from vllm.sequence import SequenceGroupMetadata
+from vllm.sequence import ExecuteModelRequest
 
 
 @dataclass
@@ -22,11 +22,14 @@ class SpeculativeProposals:
     # The valid length of each proposal; can be zero.
     proposal_lens: torch.Tensor
 
+    # A flag to mark that there's no available proposals
+    no_proposals: bool = False
+
     def __repr__(self):
         return (f"SpeculativeProposals("
-                f"proposal_token_ids={self.proposal_token_ids.shape}, "
+                f"proposal_token_ids={self.proposal_token_ids}, "
                 f"proposal_probs={self.proposal_probs.shape}, "
-                f"proposal_lens={self.proposal_lens.shape})")
+                f"proposal_lens={self.proposal_lens})")
 
 
 @dataclass
@@ -38,9 +41,17 @@ class SpeculativeScores:
     # Probabilities of the speculative tokens according to the scoring model.
     probs: torch.Tensor
 
+    # Log-probabilities of the speculative tokens according to the scoring
+    # model. These values can be used to generate Logprob objects that are
+    # returned to the user.
+    logprobs: torch.Tensor
+
     # Token ids sampled from the scoring model. Used for speculative bonus
     # tokens and also non-speculative normal decoding.
     token_ids: torch.Tensor
+
+    # Optional last hidden states from the scoring model.
+    hidden_states: Optional[torch.Tensor] = None
 
     def __repr__(self):
         return (f"SpeculativeScores("
@@ -51,13 +62,12 @@ class SpeculativeScores:
 class SpeculativeProposer(ABC):
 
     @abstractmethod
-    def get_proposals(
+    def get_spec_proposals(
         self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-        max_proposal_len: int,
+        execute_model_req: ExecuteModelRequest,
+        # If set, this contains all sequence IDs that were assigned
+        # bonus tokens in their last forward pass.
+        seq_ids_with_bonus_token_in_last_step: Set[int],
     ) -> SpeculativeProposals:
         raise NotImplementedError
 
@@ -67,11 +77,7 @@ class SpeculativeScorer(ABC):
     @abstractmethod
     def score_proposals(
         self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        blocks_to_swap_in: Optional[Dict[int, int]],
-        blocks_to_swap_out: Optional[Dict[int, int]],
-        blocks_to_copy: Optional[Dict[int, List[int]]],
-        k: int,
+        execute_model_req: ExecuteModelRequest,
         proposals: SpeculativeProposals,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> SpeculativeScores:
         raise NotImplementedError

@@ -6,10 +6,10 @@
 # Run it with `python collect_env.py` or `python -m torch.utils.collect_env`
 import datetime
 import locale
+import os
 import re
 import subprocess
 import sys
-import os
 from collections import namedtuple
 
 try:
@@ -63,6 +63,11 @@ DEFAULT_CONDA_PATTERNS = {
     "magma",
     "triton",
     "optree",
+    "nccl",
+    "transformers",
+    "zmq",
+    "nvidia",
+    "pynvml",
 }
 
 DEFAULT_PIP_PATTERNS = {
@@ -73,6 +78,11 @@ DEFAULT_PIP_PATTERNS = {
     "triton",
     "optree",
     "onnx",
+    "nccl",
+    "transformers",
+    "zmq",
+    "nvidia",
+    "pynvml",
 }
 
 
@@ -259,8 +269,9 @@ def get_neuron_sdk_version(run_lambda):
 def get_vllm_version():
     try:
         import vllm
-        return vllm.__version__
-    except ImportError:
+        return vllm.__version__ + "@" + vllm.__commit__
+    except Exception:
+        # old version of vllm does not have __commit__
         return 'N/A'
 
 
@@ -598,6 +609,11 @@ Versions of relevant libraries:
 {pip_packages}
 {conda_packages}
 """.strip()
+
+# both the above code and the following code use `strip()` to
+# remove leading/trailing whitespaces, so we need to add a newline
+# in between to separate the two sections
+env_info_fmt += "\n"
 
 env_info_fmt += """
 ROCM Version: {rocm_version}
