@@ -27,6 +27,36 @@ from vllm.tool_parsers.abstract_tool_parser import (
 logger = init_logger(__name__)
 
 
+def extract_function_name(tool_id: str) -> str:
+    """Extract function name from tool_id.
+
+    Supports multiple formats:
+    - functions.Read:0 -> Read (Kimi-K2.5 messages API format)
+    - functionswebfetch05 -> webfetch (Kimi-K2.5 format without separator)
+    - web_fetch:0 -> web_fetch (colon-separated format)
+    - web_fetch0 -> web_fetch (no separator format)
+    - web_fetch -> web_fetch (no number format)
+    """
+    # If there's a colon, extract the part before it
+    if ':' in tool_id:
+        name_part = tool_id.split(':')[0]
+        if name_part.startswith('functions.'):
+            return name_part[10:]  # strip 'functions.'
+        if name_part.startswith('functions'):
+            return name_part[9:]  # strip 'functions'
+        return name_part
+
+    # Try to extract trailing digits
+    match = re.match(r'^(.+?)(\d+)$', tool_id)
+    if match:
+        name_part = match.group(1)
+        if name_part.startswith('functions'):
+            return name_part[9:]  # strip 'functions'
+        return name_part
+
+    return tool_id
+
+
 class KimiK2ToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -42,9 +72,9 @@ class KimiK2ToolParser(ToolParser):
         self.token_buffer: str = ""
         # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
         # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 1024
+        self.buffer_max_size: int = 1024 * 32
         self.section_char_count: int = 0  # Track characters processed in tool section
-        self.max_section_chars: int = 8192  # Force exit if section exceeds this
+        self.max_section_chars: int = 8192 * 16  # Force exit if section exceeds this
         self._buffer_overflow_logged: bool = False  # Log overflow once per session
 
         # Support both singular and plural variants
@@ -63,15 +93,16 @@ class KimiK2ToolParser(ToolParser):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^<]+?)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>).)*?)\s*<\|tool_call_end\|>",
             re.DOTALL,
         )
 
+        # Support ID formats without colon (e.g. functionswebfetch05)
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<tool_call_id>.+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
+            r"(?P<tool_call_id>\S+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>.*)"
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+        self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>\S+)\s*")
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -173,8 +204,7 @@ class KimiK2ToolParser(ToolParser):
                 tool_calls = []
                 for match in function_call_tuples:
                     function_id, function_args = match
-                    # function_id: functions.get_weather:0 or get_weather:0
-                    function_name = function_id.split(":")[0].split(".")[-1]
+                    function_name = extract_function_name(function_id)
                     tool_calls.append(
                         ToolCall(
                             id=function_id,
@@ -276,8 +306,16 @@ class KimiK2ToolParser(ToolParser):
             tid in current_token_ids for tid in self.tool_calls_start_token_ids
         )
 
+        # Also check if current_text or delta_text contains tool section markers.
+        # This handles the case where a reasoning parser extracted content_ids,
+        # removing the section start token from current_token_ids.
+        has_section_text = any(
+            variant in current_text or variant in delta_text
+            for variant in self.tool_calls_start_token_variants
+        )
+
         # Early return: if no section token detected yet, return as reasoning content
-        if not has_section_token and not self.in_tool_section:
+        if not has_section_token and not self.in_tool_section and not has_section_text:
             logger.debug("No tool call tokens found!")
             # Don't clear buffer - it needs to accumulate partial markers across deltas
             # Buffer overflow is already protected by lines 215-224
@@ -384,6 +422,76 @@ class KimiK2ToolParser(ToolParser):
                 and cur_tool_end_count >= prev_tool_end_count
             ):
                 if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
+                    # This might be a complete tool call in a single delta.
+                    # Try to extract tool call from current_text before giving up.
+                    if self.tool_call_start_token in current_text:
+                        logger.debug(
+                            "Tool call starts and ends in same delta, parsing content"
+                        )
+                        tool_call_portion = current_text.split(
+                            self.tool_call_start_token
+                        )[-1]
+                        if self.tool_call_end_token in tool_call_portion:
+                            tool_call_portion = tool_call_portion.split(
+                                self.tool_call_end_token
+                            )[0].rstrip()
+
+                        self.current_tool_id += 1
+                        self.current_tool_name_sent = False
+
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                            self.prev_tool_call_arr.append({})
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+
+                        current_tool_call = dict()
+                        current_tool_call_matches = (
+                            self.stream_tool_call_portion_regex.match(
+                                tool_call_portion.strip()
+                            )
+                        )
+                        if current_tool_call_matches:
+                            tool_id, tool_args = current_tool_call_matches.groups()
+                            tool_name = extract_function_name(tool_id)
+                            current_tool_call["id"] = tool_id.strip()
+                            current_tool_call["name"] = tool_name
+                            current_tool_call["arguments"] = tool_args
+                        else:
+                            current_tool_call_name_matches = (
+                                self.stream_tool_call_name_regex.match(
+                                    tool_call_portion.strip()
+                                )
+                            )
+                            if current_tool_call_name_matches:
+                                (tool_id_str,) = (
+                                    current_tool_call_name_matches.groups()
+                                )
+                                tool_name = extract_function_name(tool_id_str)
+                                current_tool_call["id"] = tool_id_str.strip()
+                                current_tool_call["name"] = tool_name
+                                current_tool_call["arguments"] = ""
+
+                        if current_tool_call.get("name"):
+                            self.prev_tool_call_arr[self.current_tool_id] = (
+                                current_tool_call
+                            )
+                            self.current_tool_name_sent = True
+                            return DeltaMessage(
+                                tool_calls=[
+                                    DeltaToolCall(
+                                        index=self.current_tool_id,
+                                        type="function",
+                                        id=current_tool_call.get("id"),
+                                        function=DeltaFunctionCall(
+                                            name=current_tool_call["name"],
+                                            arguments=current_tool_call.get(
+                                                "arguments", ""
+                                            ),
+                                        ).model_dump(exclude_none=True),
+                                    )
+                                ]
+                            )
+
                     logger.debug("attempting to close tool call, but no tool call")
                     # Handle deferred section exit before returning
                     if deferred_section_exit and self.in_tool_section:
@@ -448,7 +556,7 @@ class KimiK2ToolParser(ToolParser):
                 )
                 if current_tool_call_matches:
                     tool_id, tool_args = current_tool_call_matches.groups()
-                    tool_name = tool_id.split(":")[0].split(".")[-1]
+                    tool_name = extract_function_name(tool_id)
                     current_tool_call["id"] = tool_id.strip()
                     current_tool_call["name"] = tool_name
                     current_tool_call["arguments"] = tool_args
@@ -458,7 +566,7 @@ class KimiK2ToolParser(ToolParser):
                     )
                     if current_tool_call_name_matches:
                         (tool_id_str,) = current_tool_call_name_matches.groups()
-                        tool_name = tool_id_str.split(":")[0].split(".")[-1]
+                        tool_name = extract_function_name(tool_id_str)
                         current_tool_call["id"] = tool_id_str.strip()
                         current_tool_call["name"] = tool_name
                         current_tool_call["arguments"] = ""
